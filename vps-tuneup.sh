@@ -9,12 +9,18 @@
 #   3. 加 swap：优先 zram（压缩内存交换，含缺模块时自动补装
 #      linux-modules-extra），zram 不可用时退回 512M swap 文件
 #   4. 给 sing-box / xray 服务加 GOMEMLIMIT + GOGC 内存帽子（systemd drop-in）
+#   5.（可选，--bbr 才执行）开启内核原生 BBR v1：net.core.default_qdisc=fq +
+#      net.ipv4.tcp_congestion_control=bbr，写 /etc/sysctl.d/99-bbr.conf 持久化，
+#      设置后回读验证。只影响 TCP，不影响 UDP/QUIC（如 Hysteria2）。
+#      本脚本永不更换内核：BBRv3 需另行换 XanMod 内核，不在脚本范围。
 #
-# 绝不碰：sshd、防火墙、网络配置、代理配置本体、tailscaled、docker。
+# 绝不碰：sshd、防火墙、代理配置本体、tailscaled、docker。网络栈默认不动；
+# 显式加 --bbr 时也只改上面那两个拥塞控制 sysctl。
 #
 # 用法：
-#   sudo bash vps-tuneup.sh            # 正式执行
-#   sudo bash vps-tuneup.sh --dry-run  # 只演练，打印将要做的事，不改系统
+#   sudo bash vps-tuneup.sh              # 正式执行（仅内存优化）
+#   sudo bash vps-tuneup.sh --bbr        # 额外开启原生 BBR v1（可与 --dry-run 组合）
+#   sudo bash vps-tuneup.sh --dry-run    # 只演练，打印将要做的事，不改系统
 #
 # 可调环境变量：
 #   GOMEMLIMIT_MIB=80   每个代理进程的内存帽子（MiB）
@@ -30,14 +36,17 @@ set -uo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 DRY_RUN=0
-case "${1:-}" in
-  --dry-run) DRY_RUN=1 ;;
-  --help|-h)
-    sed -n '2,30p' "$0" | sed 's/^#\s\?//'
-    exit 0 ;;
-  "") ;;
-  *) echo "unknown option: $1 (only --dry-run / --help)" >&2; exit 2 ;;
-esac
+ENABLE_BBR=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) DRY_RUN=1 ;;
+    --bbr) ENABLE_BBR=1 ;;
+    --help|-h)
+      sed -n '2,33p' "$0" | sed 's/^#\s\?//'
+      exit 0 ;;
+    *) echo "unknown option: $arg (only --dry-run / --bbr / --help)" >&2; exit 2 ;;
+  esac
+done
 
 GOMEMLIMIT_MIB="${GOMEMLIMIT_MIB:-80}"
 ZRAM_PERCENT="${ZRAM_PERCENT:-50}"
@@ -99,7 +108,7 @@ apt_update_once() {
   do_run apt-get update
 }
 
-echo "vps-tuneup: host=$(hostname) kernel=$(uname -r) systemd=${HAVE_SYSTEMD} apt=${HAVE_APT} dry_run=${DRY_RUN}"
+echo "vps-tuneup: host=$(hostname) kernel=$(uname -r) systemd=${HAVE_SYSTEMD} apt=${HAVE_APT} dry_run=${DRY_RUN} bbr=${ENABLE_BBR}"
 step "调优前"
 free -h || true
 
@@ -255,6 +264,51 @@ Environment=GOGC=50"
   fi
 else
   step "sing-box / xray 内存帽子"; skip "非 systemd 系统，跳过"
+fi
+
+# ---------------------------------------------------------------- 5. BBR（可选，--bbr）
+step "BBR 拥塞控制（TCP）"
+if [ "$ENABLE_BBR" = 0 ]; then
+  skip "未指定 --bbr，默认不动网络栈"
+elif ! command -v sysctl >/dev/null 2>&1; then
+  skip "无 sysctl 命令，跳过"
+else
+  cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
+  bbr_conf="net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr"
+  conf_same=0; write_file /etc/sysctl.d/99-bbr.conf "$bbr_conf" || conf_same=1
+  if [ "$cur_cc" = "bbr" ] && [ "$conf_same" = 1 ]; then
+    skip "BBR 已开启且已持久化"
+  else
+    avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
+    case " $avail " in
+      *" bbr "*) ;;
+      *)
+        do_run modprobe tcp_bbr >/dev/null 2>&1 || true
+        if [ "$DRY_RUN" = 1 ]; then
+          avail="$avail bbr"  # 演练：假设 modprobe 成功；正式运行会真实回读验证
+        else
+          avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
+        fi
+        ;;
+    esac
+    case " $avail " in
+      *" bbr "*)
+        do_run sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+        do_run sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+        if [ "$DRY_RUN" = 1 ]; then
+          ok "（演练）将开启 BBR（fq + bbr，含持久化写入；仅影响 TCP）"
+        elif [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")" = "bbr" ]; then
+          ok "BBR 已开启（fq + bbr，已持久化；仅影响 TCP，UDP/QUIC 不受影响）"
+        else
+          fail "BBR 设置后回读不是 bbr，请手动检查 sysctl 输出"
+        fi
+        ;;
+      *)
+        fail "内核无 tcp_bbr（available: ${avail:-空}），开启不了（BBRv3 需换 XanMod 等带补丁的内核）"
+        ;;
+    esac
+  fi
 fi
 
 # ---------------------------------------------------------------- 汇总

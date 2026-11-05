@@ -1,6 +1,6 @@
 # vps-tuneup
 
-小内存 Linux VPS 一键内存优化脚本。
+小内存 Linux VPS 一键优化脚本（内存调优为主，附可选的原生 BBR 开启）。把在 5 台实机（410MB–1GB，Ubuntu）上验证过的调优打法固化成一个幂等脚本：重复运行安全，单步失败不中断、最后汇总，可重跑补齐失败项。
 
 ## 做什么
 
@@ -8,10 +8,11 @@
 2. **journald 限容**：`SystemMaxUse=100M`、`RuntimeMaxUse=32M` 并 vacuum——日志失控时 journald 能吃掉 200MB+ 内存，这是实测过的最大暗坑。
 3. **加 swap**：优先 zram（压缩内存交换，大小 = 物理内存 50%，lz4，swappiness=60）。内核缺 zram 模块时自动补装 `linux-modules-extra-$(uname -r)`（Ubuntu 精简镜像常见）；zram 实在不可用时退回 512M swap 文件（swappiness=10，写 fstab 持久化）。已有 swap 时自动跳过。
 4. **代理进程内存帽子**：自动发现所有 `sing-box*` / `xray*` systemd 服务，逐个写 drop-in：`GOMEMLIMIT=80MiB` + `GOGC=50`，防止 Go 运行时堆无上限增长。
+5. **（可选）开启原生 BBR v1**：仅在加 `--bbr` 时执行——设 `net.core.default_qdisc=fq` 与 `net.ipv4.tcp_congestion_control=bbr`，写 `/etc/sysctl.d/99-bbr.conf` 持久化，设置后回读验证。只影响 TCP，UDP/QUIC（如 Hysteria2）不受影响。本脚本永不更换内核：BBRv3 需另行换 XanMod 内核，不在脚本范围内。
 
 ## 绝不碰
 
-sshd、防火墙、网络配置、代理配置本体、tailscaled、docker。全部设置均持久化，重启不丢。
+sshd、防火墙、代理配置本体、tailscaled、docker；网络栈默认不动，加 `--bbr` 时也只改上面那两个拥塞控制 sysctl。全部设置均持久化，重启不丢。
 
 ## 用法
 
@@ -21,8 +22,11 @@ sshd、防火墙、网络配置、代理配置本体、tailscaled、docker。全
 curl -fsSLO https://raw.githubusercontent.com/signyf/vps-tuneup/main/vps-tuneup.sh
 less vps-tuneup.sh              # 先审一遍
 sudo bash vps-tuneup.sh --dry-run   # 演练：只打印将要做的事，不改系统
-sudo bash vps-tuneup.sh             # 正式执行
+sudo bash vps-tuneup.sh             # 正式执行（仅内存优化）
+sudo bash vps-tuneup.sh --bbr       # 正式执行 + 开启原生 BBR v1（可与 --dry-run 组合）
 ```
+
+命令行开关：`--bbr`（开启内核原生 BBR v1，默认关）、`--dry-run`（演练模式）。
 
 运行结束会打印调优前后的 `free -h` 对比和改动/跳过/失败汇总。验收标准：`free -h` 里 Swap 不再是 0、used 明显下降。
 
