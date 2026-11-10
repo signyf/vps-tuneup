@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# vps-tuneup.sh — 小内存 Linux VPS 一键内存优化（幂等，可重复跑）
+# vps-tuneup.sh — 小内存 Linux VPS 一键优化（内存为主 + UDP 缓冲，含可选 BBR；幂等，可重复跑）
 #
 # 做什么：
 #   1. 关闭纯占内存的闲杂服务（snapd / multipathd / unattended-upgrades /
@@ -13,9 +13,13 @@
 #      net.ipv4.tcp_congestion_control=bbr，写 /etc/sysctl.d/99-bbr.conf 持久化，
 #      设置后回读验证。只影响 TCP，不影响 UDP/QUIC（如 Hysteria2）。
 #      本脚本永不更换内核：BBRv3 需另行换 XanMod 内核，不在脚本范围。
+#   6. 提高 UDP 缓冲上限：net.core.rmem_max / wmem_max 提高到 16MiB
+#      （16777216，Hysteria 官方性能文档建议值），写 /etc/sysctl.d/99-udp-buffer.conf
+#      持久化，设置后回读验证。只抬不降（现值更高时按现值落盘）。QUIC/Hysteria2
+#      的高吞吐吃这个缓冲；已运行的代理服务需重启才用上新值，本步不自动重启。
 #
-# 绝不碰：sshd、防火墙、代理配置本体、tailscaled、docker。网络栈默认不动；
-# 显式加 --bbr 时也只改上面那两个拥塞控制 sysctl。
+# 绝不碰：sshd、防火墙、代理配置本体、tailscaled、docker。网络栈默认仅抬高
+# UDP 缓冲上限；显式加 --bbr 时再改两个拥塞控制 sysctl（fq + bbr）。
 #
 # 用法：
 #   sudo bash vps-tuneup.sh              # 正式执行（仅内存优化）
@@ -27,6 +31,7 @@
 #   ZRAM_PERCENT=50     zram 大小 = 物理内存的百分比
 #   SWAPFILE_MB=512     回退 swap 文件大小（MB）
 #   JOURNAL_MAX=100M    journald 磁盘上限
+#   UDP_BUF_MAX=16777216  UDP 收发缓冲上限（字节），只抬不降
 #
 # 说明：包自动安装仅支持 apt 系（Debian/Ubuntu）；其他发行版会跳过安装，
 # 其余步骤（关服务 / journald / swap 文件 / 内存帽子）照常执行。
@@ -42,7 +47,7 @@ for arg in "$@"; do
     --dry-run) DRY_RUN=1 ;;
     --bbr) ENABLE_BBR=1 ;;
     --help|-h)
-      sed -n '2,33p' "$0" | sed 's/^#\s\?//'
+      sed -n '2,38p' "$0" | sed 's/^#\s\?//'
       exit 0 ;;
     *) echo "unknown option: $arg (only --dry-run / --bbr / --help)" >&2; exit 2 ;;
   esac
@@ -52,6 +57,7 @@ GOMEMLIMIT_MIB="${GOMEMLIMIT_MIB:-80}"
 ZRAM_PERCENT="${ZRAM_PERCENT:-50}"
 SWAPFILE_MB="${SWAPFILE_MB:-512}"
 JOURNAL_MAX="${JOURNAL_MAX:-100M}"
+UDP_BUF_MAX="${UDP_BUF_MAX:-16777216}"
 
 CHANGES=0; SKIPS=0; FAILS=0
 ok()   { printf '  [OK]   %s\n' "$*"; CHANGES=$((CHANGES+1)); }
@@ -308,6 +314,40 @@ net.ipv4.tcp_congestion_control=bbr"
         fail "内核无 tcp_bbr（available: ${avail:-空}），开启不了（BBRv3 需换 XanMod 等带补丁的内核）"
         ;;
     esac
+  fi
+fi
+
+# ---------------------------------------------------------------- 6. UDP 缓冲上限（QUIC / Hysteria2）
+step "UDP 缓冲上限（QUIC / Hysteria2）"
+if ! command -v sysctl >/dev/null 2>&1; then
+  skip "无 sysctl 命令，跳过"
+else
+  cur_r=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+  cur_w=$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)
+  case "$cur_r" in *[!0-9]*|"") cur_r=0 ;; esac
+  case "$cur_w" in *[!0-9]*|"") cur_w=0 ;; esac
+  # 只抬不降：现值已高于目标时按现值落盘，避免重跑或重启后被本步调低
+  eff_r=$UDP_BUF_MAX; [ "$cur_r" -gt "$eff_r" ] && eff_r=$cur_r
+  eff_w=$UDP_BUF_MAX; [ "$cur_w" -gt "$eff_w" ] && eff_w=$cur_w
+  udp_conf="net.core.rmem_max=${eff_r}
+net.core.wmem_max=${eff_w}"
+  udp_conf_same=0; write_file /etc/sysctl.d/99-udp-buffer.conf "$udp_conf" || udp_conf_same=1
+  if [ "$cur_r" -ge "$UDP_BUF_MAX" ] && [ "$cur_w" -ge "$UDP_BUF_MAX" ] && [ "$udp_conf_same" = 1 ]; then
+    skip "UDP 缓冲已达标（rmem_max=${cur_r} wmem_max=${cur_w}）且已持久化"
+  else
+    do_run sysctl -w "net.core.rmem_max=${eff_r}" >/dev/null 2>&1 || true
+    do_run sysctl -w "net.core.wmem_max=${eff_w}" >/dev/null 2>&1 || true
+    if [ "$DRY_RUN" = 1 ]; then
+      ok "（演练）将把 UDP 缓冲上限设为 rmem_max=${eff_r} wmem_max=${eff_w}（含持久化）"
+    else
+      new_r=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+      new_w=$(sysctl -n net.core.wmem_max 2>/dev/null || echo 0)
+      if [ "$new_r" = "$eff_r" ] && [ "$new_w" = "$eff_w" ]; then
+        ok "UDP 缓冲上限已设为 rmem_max=${eff_r} wmem_max=${eff_w}（已持久化；已运行的 QUIC/Hysteria2 服务重启后用上新值）"
+      else
+        fail "UDP 缓冲设置后回读不符（rmem_max=${new_r} wmem_max=${new_w}），请手动检查 sysctl 输出"
+      fi
+    fi
   fi
 fi
 

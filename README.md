@@ -1,6 +1,6 @@
 # vps-tuneup
 
-小内存 Linux VPS 一键优化脚本（内存调优为主，附可选的原生 BBR 开启）。把在 5 台实机（410MB–1GB，Ubuntu）上验证过的调优打法固化成一个幂等脚本：重复运行安全，单步失败不中断、最后汇总，可重跑补齐失败项。
+小内存 Linux VPS 一键优化脚本（内存调优为主，另带 UDP 缓冲抬升与可选的原生 BBR 开启）。把在 5 台实机（410MB–1GB，Ubuntu）上验证过的调优打法固化成一个幂等脚本：重复运行安全，单步失败不中断、最后汇总，可重跑补齐失败项。
 
 ## 做什么
 
@@ -9,10 +9,11 @@
 3. **加 swap**：优先 zram（压缩内存交换，大小 = 物理内存 50%，lz4，swappiness=60）。内核缺 zram 模块时自动补装 `linux-modules-extra-$(uname -r)`（Ubuntu 精简镜像常见）；zram 实在不可用时退回 512M swap 文件（swappiness=10，写 fstab 持久化）。已有 swap 时自动跳过。
 4. **代理进程内存帽子**：自动发现所有 `sing-box*` / `xray*` systemd 服务，逐个写 drop-in：`GOMEMLIMIT=80MiB` + `GOGC=50`，防止 Go 运行时堆无上限增长。
 5. **（可选）开启原生 BBR v1**：仅在加 `--bbr` 时执行——设 `net.core.default_qdisc=fq` 与 `net.ipv4.tcp_congestion_control=bbr`，写 `/etc/sysctl.d/99-bbr.conf` 持久化，设置后回读验证。只影响 TCP，UDP/QUIC（如 Hysteria2）不受影响。本脚本永不更换内核：BBRv3 需另行换 XanMod 内核，不在脚本范围内。
+6. **UDP 缓冲上限**：把 `net.core.rmem_max` / `net.core.wmem_max` 提高到 16MiB（16777216，Hysteria 官方性能文档建议值），写 `/etc/sysctl.d/99-udp-buffer.conf` 持久化，设置后回读验证。Linux 默认只有约 208KiB，跨境高延迟下会卡住 QUIC/Hysteria2 的吞吐。只抬不降：现值已更高时按现值落盘。已运行的代理服务需重启才用上新缓冲，本步不自动重启。
 
 ## 绝不碰
 
-sshd、防火墙、代理配置本体、tailscaled、docker；网络栈默认不动，加 `--bbr` 时也只改上面那两个拥塞控制 sysctl。全部设置均持久化，重启不丢。
+sshd、防火墙、代理配置本体、tailscaled、docker；网络栈默认仅抬高 UDP 缓冲上限，加 `--bbr` 时再改上面那两个拥塞控制 sysctl。全部设置均持久化，重启不丢。
 
 ## 用法
 
@@ -38,6 +39,7 @@ sudo bash vps-tuneup.sh --bbr       # 正式执行 + 开启原生 BBR v1（可�
 | `ZRAM_PERCENT` | 50 | zram 大小 = 物理内存百分比 |
 | `SWAPFILE_MB` | 512 | 回退 swap 文件大小（MB） |
 | `JOURNAL_MAX` | 100M | journald 磁盘上限 |
+| `UDP_BUF_MAX` | 16777216 | UDP 收发缓冲上限（字节），只抬不降 |
 
 例：`sudo GOMEMLIMIT_MIB=64 bash vps-tuneup.sh`
 
